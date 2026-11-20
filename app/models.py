@@ -22,12 +22,17 @@ def parse_iso(s: str) -> datetime:
 
 @dataclass(frozen=True)
 class LatestReport:
-    """某节点采样时间最新的一份探活报告。"""
+    """某节点当前生效的一份探活报告。
+
+    换过主机的节点只统计带当前 source_id 的报告，因此这里也记录其来源编号；
+    未换过主机的节点（报告来源列为空）source_id 为 None。
+    """
 
     node_id: str
     sampled_at: datetime
     healthy: bool
     boot_id: str
+    source_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,3 +45,18 @@ class PermitRecord:
     approved_at: datetime
     finished_at: datetime | None
     boot_ids_at_approval: dict[str, str]  # 获批时各节点最新报告中的启动标识
+
+
+@dataclass(frozen=True)
+class ReplacementRecord:
+    """一次节点换机登记。
+
+    节点名不变（分片仍沿用原节点名），每次登记发放新的探活来源编号；
+    同一许可下对同一节点重复登记只返回原记录（幂等）。
+    """
+
+    seq: int  # 表主键，同时构成来源编号 src-{seq}
+    request_id: str  # 凭以登记的未结许可申请号
+    node_id: str
+    source_id: str
+    registered_at: datetime

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .manifest import Manifest
-from .models import LatestReport, PermitRecord
+from .models import LatestReport, PermitRecord, ReplacementRecord
 
 
 def evaluate_permit_request(
@@ -14,7 +14,8 @@ def evaluate_permit_request(
     """校验新申请。返回 (是否批准, 详情)。
 
     批准条件（同时满足）：
-    1. 本批每个节点最新探活都健康；
+    1. 本批每个节点当前生效的最新探活都健康
+       （换过主机的节点只看带当前来源编号的报告，首份新报告到达前视为健康未知）；
     2. 本批节点未被任何未结束许可占用；
     3. 扣除本批节点、未结束许可占用节点、健康未知或异常节点后，
        本批涉及的每个分片剩余可用投票副本均过半。
@@ -84,18 +85,27 @@ def evaluate_permit_request(
 
 
 def evaluate_finish(
-    permit: PermitRecord, latest: dict[str, LatestReport]
+    permit: PermitRecord,
+    latest: dict[str, LatestReport],
+    replacements: dict[str, ReplacementRecord] | None = None,
 ) -> dict[str, str]:
     """结束许可的校验。返回 {节点: 不满足原因}，空 dict 表示可以结束。
 
-    本批每个节点都须满足：最新探活在获批后采集、显示健康、
-    启动标识与获批时不同。
+    本批每个节点都须满足：当前生效的最新探活在获批后采集、显示健康、
+    启动标识与获批时不同。换过主机的节点另有要求：其最新探活还须在
+    换机登记之后采集（带当前来源编号的报告天然满足来源匹配，这里再卡时间）。
     """
+    replacements = replacements or {}
     problems: dict[str, str] = {}
     for n in permit.nodes:
         rep = latest.get(n)
         if rep is None:
             problems[n] = "no_liveness_report"
+            continue
+        replacement = replacements.get(n)
+        if replacement is not None and rep.sampled_at <= replacement.registered_at:
+            # 换机节点：登记之后采集的新探活尚未到达
+            problems[n] = "not_sampled_after_replacement"
         elif rep.sampled_at <= permit.approved_at:
             problems[n] = "not_sampled_after_approval"
         elif not rep.healthy:

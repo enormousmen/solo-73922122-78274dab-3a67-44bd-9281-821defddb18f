@@ -12,8 +12,26 @@
   3. 扣除 *本批节点 + 未结束许可占用节点 + 健康未知/异常节点* 后，本批涉及的**每个分片**剩余可用投票副本均**过半**；否则拒绝并列出受影响分片。
 - **并发申请**在写事务（`BEGIN IMMEDIATE`）中串行判定，守住多数票。
 - **同号同批重发**返回原许可（HTTP 200）；同号不同批返回 409。
-- 许可与探活记录落盘 SQLite，**服务重启后保留**。
-- **结束许可**要求本批每个节点的最新探活：在获批后采集、健康、启动标识与获批时不同。
+- 许可、探活记录与换机登记落盘 SQLite，**服务重启后保留**，并继续按当前来源编号受理。
+- **结束许可**要求本批每个节点的最新探活：在获批后采集、健康、启动标识与获批时不同；
+  换过主机的节点还要求最新探活**在换机登记之后采集**。
+
+## 节点换机（来源编号）
+
+更换存储节点的主机时，**分片仍沿用原节点名**；新主机必须凭值班员发放的
+**探活来源编号（source_id）**上报，系统据此区分新旧主机的报告：
+
+- 值班员凭**未结许可**调用 `POST /permits/{request_id}/replacements`，为批内节点登记换机，
+  领取新的来源编号（形如 `src-1`，全局递增）。
+- **同一许可下对同一节点重复登记只返回原编号**（HTTP 200，幂等）；不同许可再次登记会发放新编号。
+- 登记生效后：
+  - 查询与计票**只看带当前编号的报告**；该节点首份新报告到达前视为**健康未知**；
+  - 未换过主机的节点照常上报（报告不得携带 `source_id`）；
+  - 换过主机的节点漏填或填错编号时，**整批报告都不入库**（事务回滚，422）。
+- 结单仍按原条件判定，换机节点的最新探活还须在**登记之后**采集
+  （不满足时原因 `not_sampled_after_replacement`）。
+- 登记、上报、发证、结单并发时，全部写路径共用同一串行写事务，**按实际生效顺序判定**。
+- 服务沿用原库重启后，仍按当前编号受理；旧版数据库（无 `source_id` 列）启动时自动迁移。
 
 ## 快速开始（Docker Compose）
 
@@ -60,13 +78,27 @@ pytest tests/ -q
 |---|---|---|
 | GET | `/healthz` | 服务健康检查 |
 | GET | `/manifest` | 查看分片清单与各分片过半线 |
-| POST | `/liveness` | 批量上报探活（201） |
-| GET | `/liveness` | 全部节点最新探活 |
-| GET | `/liveness/{node}` | 单节点最新探活 |
+| POST | `/liveness` | 批量上报探活（201；来源编号不符整批 422 拒收） |
+| GET | `/liveness` | 全部节点当前生效的最新探活 + 当前来源编号 |
+| GET | `/liveness/{node}` | 单节点最新探活（换机后首份新报告前 404） |
 | POST | `/permits` | 申请许可（201 新批 / 200 幂等重发 / 409 拒绝） |
 | GET | `/permits?status=open\|finished` | 许可列表 |
 | GET | `/permits/{request_id}` | 单个许可 |
 | POST | `/permits/{request_id}/finish` | 结束许可（200 / 409 条件不满足） |
+| POST | `/permits/{request_id}/replacements` | 登记换机领取来源编号（201 / 200 幂等） |
+| GET | `/permits/{request_id}/replacements` | 查看该许可下的换机登记 |
+
+## 换机端到端演示（Docker Compose）
+
+```bash
+docker compose up --build -d
+./examples/host-replacement-demo.sh
+```
+
+脚本自动演示：全量上报 → 申请许可 → 登记换机领取编号（重复登记幂等）→
+旧主机报告（漏填/错填编号、混合批次）全部拒收 → 首份新报告前健康未知 →
+新主机带当前编号上报 → 凭登记后采集的新探活结单。可对同一服务重复执行
+（每次使用唯一申请号）。
 
 ## 调用示例
 
@@ -140,16 +172,67 @@ curl -X POST http://localhost:8000/permits/req-001/finish
 可能原因：`no_liveness_report`、`not_sampled_after_approval`、`unhealthy`、`boot_id_unchanged`。
 许可结束后节点被释放，可被后续申请占用。
 
+### 5. 节点换机：登记、拒收旧主机报告、凭新探活结单
+
+```bash
+# 5.1 凭未结许可 req-001 为批内节点 n1 登记换机，领取来源编号
+curl -X POST http://localhost:8000/permits/req-001/replacements \
+  -H 'Content-Type: application/json' -d '{"nodes":["n1"]}'
+# 201 =>
+# {"request_id":"req-001","replacements":[
+#   {"node_id":"n1","source_id":"src-1",
+#    "registered_at":"...","request_id":"req-001"}]}
+
+# 同许可同节点重复登记 -> 200，只返回原编号 src-1
+curl -X POST http://localhost:8000/permits/req-001/replacements \
+  -H 'Content-Type: application/json' -d '{"nodes":["n1"]}'
+
+# 5.2 旧主机报告：漏填来源编号 -> 422，整批不入库
+curl -X POST http://localhost:8000/liveness \
+  -H 'Content-Type: application/json' -d '{
+    "reports":[{"node_id":"n1","sampled_at":"2026-11-20T10:00:00Z",
+                "healthy":true,"boot_id":"boot-old"}]}'
+# 422 =>
+# {"detail":{"error":"source_id_mismatch","problems":[
+#   {"node_id":"n1","expected_source_id":"src-1","got_source_id":null}]}}
+
+# 填错编号同样 422；混合批次中任一报告来源不符，整批回滚，其他节点也不入库
+curl -X POST http://localhost:8000/liveness \
+  -H 'Content-Type: application/json' -d '{
+    "reports":[{"node_id":"n1","sampled_at":"2026-11-20T10:01:00Z",
+                "healthy":true,"boot_id":"boot-old","source_id":"src-wrong"}]}'
+
+# 5.3 首份新报告到达前：查询 404，节点列入 nodes_without_reports（健康未知）
+curl http://localhost:8000/liveness/n1   # 404 no_liveness_report
+
+# 5.4 新主机带当前编号上报（采样时间须晚于登记时间）
+curl -X POST http://localhost:8000/liveness \
+  -H 'Content-Type: application/json' -d '{
+    "reports":[{"node_id":"n1","sampled_at":"2026-11-20T11:00:00Z",
+                "healthy":true,"boot_id":"boot-2","source_id":"src-1"}]}'
+
+# 5.5 结单：新探活在登记后采集、健康、启动标识已变
+curl -X POST http://localhost:8000/permits/req-001/finish
+```
+
+未换机节点的报告**不带** `source_id`，行为与旧版完全一致；若擅自携带编号，
+同样按来源不符 422 拒收。结单条件不满足时，换机节点可能返回的原因
+`not_sampled_after_replacement`（最新有效探活未在登记之后采集）。
+
 ## 设计说明
 
 - **幂等**：`request_id` 是许可表主键。节点集合规范化（去重排序）后比较，
   同号同批重放直接返回原许可；同号不同批 409。被拒绝的申请不落库，整改后可用同号重试。
-- **并发**：所有写路径走单连接 + 可重入锁 + `BEGIN IMMEDIATE` 事务，
-  "检查多数票 → 写入许可"是原子的；并发申请串行判定，不会超批。
-- **持久化**：许可与全部探活报告存 SQLite（WAL 模式），最新探活按
-  `max(sampled_at)` 实时计算，服务重启后状态完整恢复。
-- **结束判定**：批准时快照各节点 `boot_id`；结束时要求最新报告
-  `sampled_at > approved_at` 且健康且 `boot_id` 不同。
+  换机登记以 `(request_id, node_id)` 唯一约束兜底，重复登记返回原来源编号。
+- **并发**：所有写路径（申请、登记、上报、结单）走单连接 + 可重入锁 +
+  `BEGIN IMMEDIATE` 事务，串行提交，按实际生效顺序判定，不会超批、不会错收报告。
+- **持久化**：许可、全部探活报告、换机登记存 SQLite（WAL 模式）。
+  最新探活实时计算：换机节点只匹配其当前 `source_id`，未换机节点只匹配
+  `source_id IS NULL`；服务重启后状态完整恢复，继续按当前编号受理。
+  旧库启动时自动 `ALTER TABLE` 补齐来源编号列，历史报告视为无编号（未换机）。
+- **结束判定**：批准时快照各节点 `boot_id`；结束时要求最新有效报告
+  `sampled_at > approved_at` 且健康且 `boot_id` 不同；换机节点再要求
+  `sampled_at > 登记时间`。
 
 ## 已知限制 / 未完成项
 
